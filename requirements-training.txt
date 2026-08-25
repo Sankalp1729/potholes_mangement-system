@@ -1,0 +1,10 @@
+# Minimal dependencies for the real YOLOv8 training/evaluation pipeline.
+# This file is intentionally separate from requirements.txt so training does
+# not require PostgreSQL, Redis, cloud, notification, or frontend dependencies.
+
+ultralytics>=8.3.0,<9.0.0
+torch>=2.1.0
+torchvision>=0.16.0
+numpy>=1.24,<3
+Pillow>=10.0
+PyYAML>=6.0
