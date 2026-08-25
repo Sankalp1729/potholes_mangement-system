@@ -6,44 +6,45 @@ This repository is wired to the supplied **IIT Madras Pothole Detection v2** dat
 - `longitudinal crack`
 - `pothole`
 
-The dataset itself is not committed to Git because the images are too large for normal source control. Extract the downloaded ZIP to:
+The dataset itself is not committed to Git because the images are too large for normal source control.
 
-```text
-datasets/pothole_detection_v2/
-```
+## 1. Prepare the supplied ZIP
 
-so that `data.yaml` is at `datasets/pothole_detection_v2/data.yaml`.
-
-## Train
-
-Install only the training dependencies:
+Install only the lightweight training dependencies:
 
 ```bash
 python -m pip install -r requirements-training.txt
 ```
 
-Then:
+Then extract/validate the ZIP with the project utility:
+
+```bash
+python scripts/prepare_dataset.py --zip "path/to/Pothole detection.v2i.yolov8.zip"
+```
+
+This creates:
+
+```text
+datasets/pothole_detection_v2/data.yaml
+datasets/pothole_detection_v2/train/images/
+datasets/pothole_detection_v2/train/labels/
+datasets/pothole_detection_v2/valid/images/
+datasets/pothole_detection_v2/valid/labels/
+datasets/pothole_detection_v2/test/images/
+datasets/pothole_detection_v2/test/labels/
+```
+
+## 2. Train
 
 ```bash
 python scripts/train_yolo.py --data datasets/pothole_detection_v2/data.yaml
 ```
 
-The default configuration uses a pretrained `yolov8m.pt`, 640px images, 150 epochs, early stopping (`patience=35`), deterministic seed 42, and held-out test evaluation. Override settings when necessary:
-
-```bash
-python scripts/train_yolo.py \
-  --data datasets/pothole_detection_v2/data.yaml \
-  --model yolov8m.pt \
-  --epochs 150 \
-  --imgsz 640 \
-  --batch -1
-```
+The default configuration uses a pretrained `yolov8m.pt`, 640px images, 150 epochs, early stopping (`patience=35`), deterministic seed 42, cosine learning-rate scheduling, and held-out test evaluation.
 
 On a CUDA GPU, `--batch -1` lets Ultralytics auto-select a batch size. On CPU, use a small explicit batch such as `--batch 4`.
 
-## Evaluate
-
-After training:
+## 3. Evaluate
 
 ```bash
 python scripts/evaluate_yolo.py \
@@ -55,13 +56,15 @@ Metrics are written to `models/pothole_detector/test_metrics.json`.
 
 The primary object-detection metrics are **mAP@50, mAP@50:95, precision, and recall**. There is deliberately no fake "100% accuracy" value.
 
-## API inference
+## 4. API inference
 
-The FastAPI endpoint now loads the trained checkpoint:
+The FastAPI endpoint loads the trained checkpoint:
 
 ```text
 POST /detect-image
 ```
+
+The report form also sends uploaded images to `/upload-report`, where the same detector is used before the report is stored.
 
 Set a custom checkpoint path if required:
 
