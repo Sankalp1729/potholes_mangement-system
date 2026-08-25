@@ -11,9 +11,11 @@ sqlalchemy==2.0.23
 alembic==1.12.1
 
 # ML and Data Science
+# Keep the runtime version aligned with the training environment so the
+# trained YOLO checkpoint is loaded by the same supported Ultralytics line.
 torch==2.1.0
 torchvision==0.16.0
-ultralytics==8.0.196
+ultralytics>=8.3.0,<9.0.0
 onnxruntime==1.16.1
 scikit-learn==1.3.2
 xgboost==2.0.1
@@ -45,5 +47,5 @@ prometheus-client==0.19.0
 # Utilities
 python-dotenv==1.0.0
 requests==2.31.0
-aiofiles==23.2.1
+ aiofiles==23.2.1
 httpx==0.25.2
