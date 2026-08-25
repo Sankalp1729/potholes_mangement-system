@@ -1,25 +1,42 @@
 """
-FastAPI Backend for Pothole Detection System
-This demonstrates the core API structure based on your roadmap
+FastAPI backend for the Pothole Detection System.
+
+Image detection is backed by the trained YOLOv8 checkpoint produced by
+scripts/train_yolo.py. The API never fabricates detections: if the model
+is not installed/trained, /detect-image returns a clear 503 response.
 """
 
-from fastapi import FastAPI, HTTPException, Depends, UploadFile, File
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import List, Optional
-from datetime import datetime
-import asyncpg
-import asyncio
-import os
-from pathlib import Path
+from __future__ import annotations
 
-# Pydantic models
+import io
+import os
+from datetime import datetime
+from pathlib import Path
+from typing import List, Optional
+
+import asyncpg
+import numpy as np
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from PIL import Image
+from pydantic import BaseModel
+
+ROOT_DIR = Path(__file__).resolve().parents[1]
+DEFAULT_MODEL_PATH = ROOT_DIR / "models" / "pothole_detector" / "weights" / "best.pt"
+YOLO_MODEL_PATH = Path(os.getenv("YOLO_MODEL_PATH", DEFAULT_MODEL_PATH))
+YOLO_CONFIDENCE = float(os.getenv("YOLO_CONFIDENCE", "0.25"))
+YOLO_IOU = float(os.getenv("YOLO_IOU", "0.50"))
+
+_yolo_model = None
+
+
 class PotholeCreate(BaseModel):
     latitude: float
     longitude: float
     severity: str
     description: Optional[str] = None
     report_source: str = "mobile"
+
 
 class PotholeResponse(BaseModel):
     id: int
@@ -31,11 +48,13 @@ class PotholeResponse(BaseModel):
     description: Optional[str]
     timestamp: datetime
 
+
 class PredictionResponse(BaseModel):
     region: str
     date: str
     pothole_count: int
     confidence_score: float
+
 
 class DetectionResult(BaseModel):
     detected: bool
@@ -43,58 +62,86 @@ class DetectionResult(BaseModel):
     severity: str
     bounding_boxes: List[dict]
 
-# FastAPI app initialization
+
 app = FastAPI(
     title="Pothole Detection API",
-    description="API for pothole detection, reporting, and management system",
-    version="1.0.0"
+    description="Pothole detection, reporting, and management API",
+    version="2.0.0",
 )
 
-# CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure appropriately for production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Database connection
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://username:password@localhost:5432/pothole_db")
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql://username:password@localhost:5432/pothole_db",
+)
+
 
 async def get_db_connection():
-    """Get database connection"""
     return await asyncpg.connect(DATABASE_URL)
 
-# API Endpoints
+
+def get_yolo_model():
+    """Load the detector once, on first inference."""
+    global _yolo_model
+    if _yolo_model is not None:
+        return _yolo_model
+
+    if not YOLO_MODEL_PATH.exists():
+        raise FileNotFoundError(
+            f"Trained YOLO model not found at {YOLO_MODEL_PATH}. "
+            "Run scripts/train_yolo.py first."
+        )
+
+    from ultralytics import YOLO
+
+    _yolo_model = YOLO(str(YOLO_MODEL_PATH))
+    return _yolo_model
+
 
 @app.get("/")
 async def root():
-    """Health check endpoint"""
-    return {"message": "Pothole Detection API is running", "version": "1.0.0"}
+    return {
+        "message": "Pothole Detection API is running",
+        "version": "2.0.0",
+        "model_path": str(YOLO_MODEL_PATH),
+        "model_ready": YOLO_MODEL_PATH.exists(),
+    }
+
+
+@app.get("/model-status")
+async def model_status():
+    return {
+        "ready": YOLO_MODEL_PATH.exists(),
+        "model_path": str(YOLO_MODEL_PATH),
+        "confidence_threshold": YOLO_CONFIDENCE,
+        "iou_threshold": YOLO_IOU,
+    }
+
 
 @app.post("/upload-report", response_model=dict)
 async def upload_report(
     pothole: PotholeCreate,
-    image: Optional[UploadFile] = File(None)
+    image: Optional[UploadFile] = File(None),
 ):
-    """Upload a new pothole report with optional image"""
     try:
         conn = await get_db_connection()
-        
-        # Save image to S3 (simulated)
         image_url = None
         if image:
-            # In production, upload to AWS S3
-            image_url = f"https://s3.amazonaws.com/pothole-images/{image.filename}"
-        
-        # Insert pothole record
-        query = '''
-            INSERT INTO potholes (latitude, longitude, severity, report_source, description, image_url)
+            image_url = f"uploaded://{image.filename}"
+
+        query = """
+            INSERT INTO potholes
+                (latitude, longitude, severity, report_source, description, image_url)
             VALUES ($1, $2, $3, $4, $5, $6)
             RETURNING id
-        '''
-        
+        """
         pothole_id = await conn.fetchval(
             query,
             pothole.latitude,
@@ -102,204 +149,249 @@ async def upload_report(
             pothole.severity,
             pothole.report_source,
             pothole.description,
-            image_url
+            image_url,
         )
-        
         await conn.close()
-        
-        # Trigger ML detection if image provided (simulated)
+
         detection_result = None
         if image:
             detection_result = await run_yolo_detection(image)
-        
+
         return {
             "success": True,
             "pothole_id": pothole_id,
             "message": "Report uploaded successfully",
-            "detection_result": detection_result
+            "detection_result": detection_result,
         }
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error uploading report: {str(e)}")
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Error uploading report: {exc}")
+
 
 @app.get("/potholes", response_model=List[PotholeResponse])
 async def get_potholes(
     status: Optional[str] = None,
     severity: Optional[str] = None,
-    limit: int = 100
+    limit: int = 100,
 ):
-    """Get all potholes with optional filtering"""
     try:
         conn = await get_db_connection()
-        
         query = "SELECT * FROM potholes WHERE 1=1"
         params = []
         param_count = 0
-        
+
         if status:
             param_count += 1
             query += f" AND status = ${param_count}"
             params.append(status)
-            
+
         if severity:
             param_count += 1
             query += f" AND severity = ${param_count}"
             params.append(severity)
-        
+
         query += f" ORDER BY timestamp DESC LIMIT ${param_count + 1}"
         params.append(limit)
-        
         rows = await conn.fetch(query, *params)
         await conn.close()
-        
         return [dict(row) for row in rows]
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error fetching potholes: {str(e)}")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Error fetching potholes: {exc}")
+
 
 @app.post("/detect-image", response_model=DetectionResult)
 async def detect_image(image: UploadFile = File(...)):
-    """Run YOLO detection on uploaded image"""
+    if not image.content_type or not image.content_type.startswith("image/"):
+        raise HTTPException(status_code=415, detail="Please upload a valid image file.")
+
     try:
-        detection_result = await run_yolo_detection(image)
-        return detection_result
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error detecting potholes: {str(e)}")
+        return await run_yolo_detection(image)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Error detecting potholes: {exc}")
+
 
 @app.get("/predict", response_model=List[PredictionResponse])
 async def get_predictions(region: Optional[str] = None):
-    """Get pothole predictions using ML models"""
     try:
         conn = await get_db_connection()
-        
         query = "SELECT * FROM predictions WHERE 1=1"
         params = []
-        
         if region:
             query += " AND region = $1"
             params.append(region)
-        
         query += " ORDER BY date DESC LIMIT 30"
-        
         rows = await conn.fetch(query, *params)
         await conn.close()
-        
         return [dict(row) for row in rows]
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error fetching predictions: {str(e)}")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Error fetching predictions: {exc}")
+
 
 @app.post("/update-status")
 async def update_pothole_status(pothole_id: int, new_status: str):
-    """Update pothole status (for authorities)"""
     try:
         conn = await get_db_connection()
-        
-        query = '''
-            UPDATE potholes 
+        query = """
+            UPDATE potholes
             SET status = $1, updated_at = CURRENT_TIMESTAMP
             WHERE id = $2
-        '''
-        
+        """
         await conn.execute(query, new_status, pothole_id)
         await conn.close()
-        
-        # Send notification to reporter (simulated)
         await send_status_notification(pothole_id, new_status)
-        
         return {"success": True, "message": "Status updated successfully"}
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error updating status: {str(e)}")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Error updating status: {exc}")
+
 
 @app.post("/iot-data")
 async def receive_iot_data(sensor_data: dict):
-    """Receive data from IoT sensors (ESP32 + accelerometer)"""
+    """Store IoT data and use the existing rule-based fallback.
+
+    The supplied IIT Madras dataset contains images only, so it cannot
+    legitimately train the sensor classifier. We therefore do not pretend
+    that the image dataset trained this endpoint.
+    """
     try:
         conn = await get_db_connection()
-        
-        # Insert sensor reading
-        query = '''
-            INSERT INTO sensor_readings 
-            (sensor_id, vibration_x, vibration_y, vibration_z, acceleration)
+        query = """
+            INSERT INTO sensor_readings
+                (sensor_id, vibration_x, vibration_y, vibration_z, acceleration)
             VALUES ($1, $2, $3, $4, $5)
-        '''
-        
+        """
         await conn.execute(
             query,
             sensor_data["sensor_id"],
             sensor_data["vibration_x"],
             sensor_data["vibration_y"],
             sensor_data["vibration_z"],
-            sensor_data["acceleration"]
+            sensor_data["acceleration"],
         )
-        
-        # Run ML model to detect pothole from sensor data
-        pothole_detected = await detect_pothole_from_sensor(sensor_data)
-        
-        if pothole_detected:
-            # Create automatic pothole report
-            await create_automatic_report(sensor_data)
-        
-        await conn.close()
-        
-        return {"success": True, "pothole_detected": pothole_detected}
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing IoT data: {str(e)}")
 
-# Helper functions (simulated ML operations)
+        pothole_detected = await detect_pothole_from_sensor(sensor_data)
+        if pothole_detected:
+            await create_automatic_report(sensor_data)
+
+        await conn.close()
+        return {
+            "success": True,
+            "pothole_detected": pothole_detected,
+            "method": "rule_based_fallback",
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Error processing IoT data: {exc}")
+
 
 async def run_yolo_detection(image: UploadFile) -> DetectionResult:
-    """Simulate YOLOv8 pothole detection"""
-    # In production, this would load your trained YOLO model and run inference
-    return DetectionResult(
-        detected=True,
-        confidence=0.87,
-        severity="medium",
-        bounding_boxes=[
-            {"x": 100, "y": 150, "width": 80, "height": 60, "confidence": 0.87}
-        ]
+    """Run real YOLO inference on an uploaded image."""
+    model = get_yolo_model()
+    raw = await image.read()
+    if not raw:
+        raise ValueError("Uploaded image is empty.")
+
+    pil_image = Image.open(io.BytesIO(raw)).convert("RGB")
+    results = model.predict(
+        source=np.asarray(pil_image),
+        conf=YOLO_CONFIDENCE,
+        iou=YOLO_IOU,
+        imgsz=640,
+        verbose=False,
     )
 
+    result = results[0]
+    names = result.names or {}
+    boxes = []
+    pothole_confidences = []
+    pothole_areas = []
+    image_area = pil_image.width * pil_image.height
+
+    if result.boxes is not None:
+        xyxy = result.boxes.xyxy.cpu().numpy()
+        confidences = result.boxes.conf.cpu().numpy()
+        classes = result.boxes.cls.cpu().numpy().astype(int)
+
+        for coords, confidence, class_id in zip(xyxy, confidences, classes):
+            x1, y1, x2, y2 = map(float, coords)
+            class_name = str(names.get(int(class_id), int(class_id)))
+            width = max(0.0, x2 - x1)
+            height = max(0.0, y2 - y1)
+            area_ratio = (width * height) / max(image_area, 1)
+
+            boxes.append(
+                {
+                    "x": round(x1, 2),
+                    "y": round(y1, 2),
+                    "width": round(width, 2),
+                    "height": round(height, 2),
+                    "confidence": round(float(confidence), 4),
+                    "class_id": int(class_id),
+                    "class_name": class_name,
+                    "area_ratio": round(area_ratio, 6),
+                }
+            )
+
+            if class_name.strip().lower() == "pothole":
+                pothole_confidences.append(float(confidence))
+                pothole_areas.append(area_ratio)
+
+    detected = bool(pothole_confidences)
+    confidence = max(pothole_confidences, default=0.0)
+    largest_area = max(pothole_areas, default=0.0)
+
+    # The dataset has no severity labels. Severity is therefore an explicit
+    # area-based heuristic and must not be represented as a learned score.
+    if largest_area >= 0.08:
+        severity = "high"
+    elif largest_area >= 0.03:
+        severity = "medium"
+    elif detected:
+        severity = "low"
+    else:
+        severity = "none"
+
+    return DetectionResult(
+        detected=detected,
+        confidence=round(confidence, 4),
+        severity=severity,
+        bounding_boxes=boxes,
+    )
+
+
 async def detect_pothole_from_sensor(sensor_data: dict) -> bool:
-    """Simulate ML model for sensor-based pothole detection"""
-    # In production, this would use your trained RandomForest/XGBoost model
     acceleration = sensor_data.get("acceleration", 0)
-    return acceleration > 2.5  # Threshold for pothole detection
+    return acceleration > 2.5
+
 
 async def create_automatic_report(sensor_data: dict):
-    """Create automatic pothole report from IoT sensor"""
     conn = await get_db_connection()
-    
-    # Get sensor location
     sensor_query = "SELECT latitude, longitude FROM iot_sensors WHERE sensor_id = $1"
     sensor_info = await conn.fetchrow(sensor_query, sensor_data["sensor_id"])
-    
+
     if sensor_info:
-        # Insert automatic pothole report
-        query = '''
-            INSERT INTO potholes (latitude, longitude, severity, report_source, description)
+        query = """
+            INSERT INTO potholes
+                (latitude, longitude, severity, report_source, description)
             VALUES ($1, $2, $3, $4, $5)
-        '''
-        
+        """
         await conn.execute(
             query,
             sensor_info["latitude"],
             sensor_info["longitude"],
-            "medium",  # Default severity for IoT detection
+            "medium",
             "iot",
-            f"Automatically detected by sensor {sensor_data['sensor_id']}"
+            f"Automatically detected by sensor {sensor_data['sensor_id']}",
         )
-    
     await conn.close()
 
+
 async def send_status_notification(pothole_id: int, status: str):
-    """Send notification about status update"""
-    # In production, integrate with SendGrid/Twilio
     print(f"Notification: Pothole {pothole_id} status updated to {status}")
+
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host="0.0.0.0", port=8000)
