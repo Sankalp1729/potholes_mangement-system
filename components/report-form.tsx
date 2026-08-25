@@ -11,6 +11,8 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Card, CardContent } from "@/components/ui/card"
 import { Camera, MapPin, Upload } from "lucide-react"
 
+const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000"
+
 export function ReportForm() {
   const [formData, setFormData] = useState({
     description: "",
@@ -19,12 +21,50 @@ export function ReportForm() {
     longitude: "",
     image: null as File | null,
   })
+  const [submitting, setSubmitting] = useState(false)
+  const [message, setMessage] = useState<string | null>(null)
+  const [detection, setDetection] = useState<any>(null)
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
-    // In a real implementation, this would call your FastAPI backend
-    console.log("Submitting report:", formData)
-    alert("Report submitted successfully! (This is a demo)")
+    setSubmitting(true)
+    setMessage(null)
+    setDetection(null)
+
+    try {
+      if (!formData.latitude || !formData.longitude) {
+        throw new Error("Please provide your location or use Get Current Location.")
+      }
+      if (!formData.severity) {
+        throw new Error("Please select a severity level.")
+      }
+
+      const body = new FormData()
+      body.append("latitude", formData.latitude)
+      body.append("longitude", formData.longitude)
+      body.append("severity", formData.severity)
+      body.append("description", formData.description)
+      body.append("report_source", "web")
+      if (formData.image) body.append("image", formData.image)
+
+      const response = await fetch(`${API_URL}/upload-report`, {
+        method: "POST",
+        body,
+      })
+
+      const data = await response.json().catch(() => ({}))
+      if (!response.ok) {
+        throw new Error(data.detail || `Request failed with status ${response.status}`)
+      }
+
+      setDetection(data.detection_result)
+      setMessage("Report submitted successfully.")
+      setFormData((prev) => ({ ...prev, description: "", image: null }))
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Unable to submit report.")
+    } finally {
+      setSubmitting(false)
+    }
   }
 
   const getCurrentLocation = () => {
@@ -39,19 +79,17 @@ export function ReportForm() {
         },
         (error) => {
           console.error("Error getting location:", error)
-          alert("Unable to get current location")
+          setMessage("Unable to get current location.")
         },
       )
     } else {
-      alert("Geolocation is not supported by this browser")
+      setMessage("Geolocation is not supported by this browser.")
     }
   }
 
   const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
-    if (file) {
-      setFormData((prev) => ({ ...prev, image: file }))
-    }
+    if (file) setFormData((prev) => ({ ...prev, image: file }))
   }
 
   return (
@@ -71,7 +109,7 @@ export function ReportForm() {
 
           <div>
             <Label htmlFor="severity">Severity Level</Label>
-            <Select onValueChange={(value) => setFormData((prev) => ({ ...prev, severity: value }))}>
+            <Select value={formData.severity} onValueChange={(value) => setFormData((prev) => ({ ...prev, severity: value }))}>
               <SelectTrigger className="mt-1">
                 <SelectValue placeholder="Select severity level" />
               </SelectTrigger>
@@ -87,27 +125,11 @@ export function ReportForm() {
           <div className="grid grid-cols-2 gap-4">
             <div>
               <Label htmlFor="latitude">Latitude</Label>
-              <Input
-                id="latitude"
-                type="number"
-                step="any"
-                placeholder="40.7128"
-                value={formData.latitude}
-                onChange={(e) => setFormData((prev) => ({ ...prev, latitude: e.target.value }))}
-                className="mt-1"
-              />
+              <Input id="latitude" type="number" step="any" placeholder="19.0760" value={formData.latitude} onChange={(e) => setFormData((prev) => ({ ...prev, latitude: e.target.value }))} className="mt-1" />
             </div>
             <div>
               <Label htmlFor="longitude">Longitude</Label>
-              <Input
-                id="longitude"
-                type="number"
-                step="any"
-                placeholder="-74.0060"
-                value={formData.longitude}
-                onChange={(e) => setFormData((prev) => ({ ...prev, longitude: e.target.value }))}
-                className="mt-1"
-              />
+              <Input id="longitude" type="number" step="any" placeholder="72.8777" value={formData.longitude} onChange={(e) => setFormData((prev) => ({ ...prev, longitude: e.target.value }))} className="mt-1" />
             </div>
           </div>
 
@@ -139,19 +161,31 @@ export function ReportForm() {
           <div className="bg-blue-50 p-4 rounded-lg">
             <h4 className="font-semibold text-blue-900 mb-2">AI Detection</h4>
             <p className="text-sm text-blue-700">
-              Our YOLOv8 model will automatically analyze your image to detect and classify the pothole severity.
+              The trained YOLOv8 model analyzes the uploaded image and returns real road-damage detections and bounding boxes.
             </p>
           </div>
+
+          {detection && (
+            <div className="rounded-lg border p-4 text-sm">
+              <p className="font-semibold">AI result</p>
+              <p>{detection.detected ? "Pothole detected" : "No pothole detected"}</p>
+              <p>Confidence: {(Number(detection.confidence) * 100).toFixed(1)}%</p>
+              <p>Severity heuristic: {detection.severity}</p>
+              <p>Detected objects: {detection.bounding_boxes?.length ?? 0}</p>
+            </div>
+          )}
         </div>
       </div>
 
+      {message && <p className="text-sm rounded-lg bg-gray-50 p-3">{message}</p>}
+
       <div className="flex justify-end space-x-4">
-        <Button type="button" variant="outline">
+        <Button type="button" variant="outline" disabled={submitting}>
           Save as Draft
         </Button>
-        <Button type="submit">
+        <Button type="submit" disabled={submitting}>
           <Upload className="w-4 h-4 mr-2" />
-          Submit Report
+          {submitting ? "Submitting..." : "Submit Report"}
         </Button>
       </div>
     </form>
