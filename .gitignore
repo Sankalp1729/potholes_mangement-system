@@ -33,3 +33,14 @@ next-env.d.ts
 /models/
 /runs/
 /wandb/
+
+# Python virtual environment
+.venv/
+venv/
+env/
+
+# Large model files
+*.pt
+*.pth
+*.onnx
+*.weights
